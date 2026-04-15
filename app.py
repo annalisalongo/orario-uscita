@@ -1,294 +1,381 @@
 from __future__ import annotations
 
 import csv
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta, time
 from pathlib import Path
-from typing import Dict, List
 
+import pandas as pd
 import streamlit as st
 
-st.set_page_config(
-    page_title="Orario di uscita",
-    page_icon="🕒",
-    layout="centered",
-)
 
-ORE_LAVORO = 7
-MINUTI_LAVORO = 38
-USCITA_MINIMA = "16:38"
-DATA_DIR = Path(__file__).parent / "data"
-DATA_FILE = DATA_DIR / "giornate.csv"
-WEEKDAY_LABELS = [
-    "Lunedì",
-    "Martedì",
-    "Mercoledì",
-    "Giovedì",
-    "Venerdì",
-    "Sabato",
-    "Domenica",
-]
+st.set_page_config(page_title="Orario di Uscita", page_icon="🕒", layout="centered")
+
+APP_DIR = Path(__file__).parent
+DATA_DIR = APP_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+PLANS_CSV = DATA_DIR / "agile_plan.csv"
+LOGS_CSV = DATA_DIR / "week_log.csv"
+
+WORK_DURATION = timedelta(hours=7, minutes=38)
+MIN_EXIT_TIME = time(hour=16, minute=38)
+DAY_NAMES = {
+    0: "Lunedì",
+    1: "Martedì",
+    2: "Mercoledì",
+    3: "Giovedì",
+    4: "Venerdì",
+    5: "Sabato",
+    6: "Domenica",
+}
 
 
+def ensure_csv(path: Path, headers: list[str]) -> None:
+    if not path.exists():
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
 
-def inject_style() -> None:
+
+ensure_csv(PLANS_CSV, ["date", "mode", "updated_at"])
+ensure_csv(LOGS_CSV, ["date", "start_time", "pause_minutes", "work_mode", "theoretical_exit", "final_exit", "updated_at"])
+
+
+def read_csv(path: Path) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        df = pd.DataFrame()
+    return df
+
+
+def parse_manual_time(text: str) -> time:
+    return datetime.strptime(text.strip(), "%H:%M").time()
+
+
+def combine_day_and_time(d: date, t: time) -> datetime:
+    return datetime.combine(d, t)
+
+
+def current_week_bounds(anchor: date | None = None) -> tuple[date, date]:
+    if anchor is None:
+        anchor = date.today()
+    monday = anchor - timedelta(days=anchor.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday, sunday
+
+
+def save_plan(plan_date: date, mode: str) -> None:
+    df = read_csv(PLANS_CSV)
+    if df.empty:
+        df = pd.DataFrame(columns=["date", "mode", "updated_at"])
+
+    date_str = plan_date.isoformat()
+    now_str = datetime.now().isoformat(timespec="seconds")
+
+    row = {"date": date_str, "mode": mode, "updated_at": now_str}
+
+    if "date" in df.columns and (df["date"] == date_str).any():
+        df.loc[df["date"] == date_str, ["mode", "updated_at"]] = [mode, now_str]
+    else:
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+    df = df.sort_values("date")
+    df.to_csv(PLANS_CSV, index=False)
+
+
+def save_log(log_date: date, start_t: time, pause_minutes: int, work_mode: str, theoretical_exit: time, final_exit: time) -> None:
+    df = read_csv(LOGS_CSV)
+    if df.empty:
+        df = pd.DataFrame(columns=["date", "start_time", "pause_minutes", "work_mode", "theoretical_exit", "final_exit", "updated_at"])
+
+    date_str = log_date.isoformat()
+    now_str = datetime.now().isoformat(timespec="seconds")
+
+    row = {
+        "date": date_str,
+        "start_time": start_t.strftime("%H:%M"),
+        "pause_minutes": pause_minutes,
+        "work_mode": work_mode,
+        "theoretical_exit": theoretical_exit.strftime("%H:%M"),
+        "final_exit": final_exit.strftime("%H:%M"),
+        "updated_at": now_str,
+    }
+
+    if "date" in df.columns and (df["date"] == date_str).any():
+        for key, value in row.items():
+            df.loc[df["date"] == date_str, key] = value
+    else:
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+    df = df.sort_values("date")
+    df.to_csv(LOGS_CSV, index=False)
+
+
+def get_plan_for_day(target_date: date) -> str:
+    df = read_csv(PLANS_CSV)
+    if df.empty or "date" not in df.columns:
+        return "Non impostato"
+    row = df[df["date"] == target_date.isoformat()]
+    if row.empty:
+        return "Non impostato"
+    return str(row.iloc[-1]["mode"])
+
+
+def get_log_for_day(target_date: date) -> dict | None:
+    df = read_csv(LOGS_CSV)
+    if df.empty or "date" not in df.columns:
+        return None
+    row = df[df["date"] == target_date.isoformat()]
+    if row.empty:
+        return None
+    return row.iloc[-1].to_dict()
+
+
+def build_week_summary(anchor: date | None = None) -> pd.DataFrame:
+    monday, sunday = current_week_bounds(anchor)
+    dates = [monday + timedelta(days=i) for i in range(7)]
+
+    plans = read_csv(PLANS_CSV)
+    logs = read_csv(LOGS_CSV)
+
+    if plans.empty:
+        plans = pd.DataFrame(columns=["date", "mode"])
+    if logs.empty:
+        logs = pd.DataFrame(columns=["date", "start_time", "pause_minutes", "final_exit"])
+
+    rows = []
+    for d in dates:
+        d_str = d.isoformat()
+
+        plan_mode = "Non impostato"
+        if "date" in plans.columns and (plans["date"] == d_str).any():
+            plan_mode = str(plans.loc[plans["date"] == d_str, "mode"].iloc[-1])
+
+        start_time = ""
+        pause = ""
+        exit_time = ""
+        if "date" in logs.columns and (logs["date"] == d_str).any():
+            log_row = logs.loc[logs["date"] == d_str].iloc[-1]
+            start_time = str(log_row.get("start_time", ""))
+            pause_min = str(log_row.get("pause_minutes", ""))
+            pause = f"{pause_min} min" if pause_min else ""
+            exit_time = str(log_row.get("final_exit", ""))
+
+        rows.append(
+            {
+                "Giorno": DAY_NAMES[d.weekday()],
+                "Data": d.strftime("%d/%m/%Y"),
+                "Modalità": plan_mode,
+                "Ingresso": start_time,
+                "Pausa": pause,
+                "Uscita": exit_time,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def style_page() -> None:
     st.markdown(
         """
         <style>
-        .main-title {
-            font-size: 2.15rem;
-            font-weight: 800;
-            margin-bottom: 0.2rem;
-            letter-spacing: -0.02em;
-        }
-        .subtitle {
-            color: #6b7280;
-            margin-bottom: 1.1rem;
-        }
-        .result-card {
-            padding: 1.2rem 1.4rem;
+        .block-container {padding-top: 1.6rem; padding-bottom: 2rem;}
+        .title {font-size: 2.1rem; font-weight: 800; margin-bottom: 0.2rem;}
+        .subtitle {color: #6b7280; margin-bottom: 1rem;}
+        .card {
+            border: 1px solid rgba(120,120,120,0.18);
             border-radius: 20px;
-            border: 1px solid rgba(120,120,120,0.16);
-            background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,248,230,0.92));
-            box-shadow: 0 8px 24px rgba(0,0,0,0.05);
-            margin: 0.9rem 0 0.3rem 0;
+            padding: 1rem 1.1rem;
+            background: rgba(255,255,255,0.60);
+            box-shadow: 0 8px 22px rgba(0,0,0,0.04);
+            margin-top: 0.8rem;
         }
-        .result-kicker {
-            color: #7a6a45;
-            font-size: 0.95rem;
-        }
-        .result-time {
-            font-size: 2.3rem;
-            font-weight: 900;
-            margin: 0.18rem 0;
-            color: #2f2a1f;
-        }
-        .muted-note {
-            color: #6b7280;
-            font-size: 0.95rem;
-        }
-        .week-card {
-            padding: 0.9rem 1rem;
-            border-radius: 16px;
-            border: 1px solid rgba(120,120,120,0.14);
-            background: rgba(255,255,255,0.66);
-            margin-top: 1rem;
-        }
+        .result-time {font-size: 2.2rem; font-weight: 800; margin: 0.2rem 0;}
+        .soft {color: #6b7280; font-size: 0.95rem;}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-
-def ensure_storage() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not DATA_FILE.exists():
-        with DATA_FILE.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["date", "weekday", "start", "pause_minutes", "agile", "theoretical_exit", "final_exit"],
-            )
-            writer.writeheader()
-
-
-
-def load_records() -> List[Dict[str, str]]:
-    ensure_storage()
-    with DATA_FILE.open("r", newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
-
-def upsert_record(record: Dict[str, str]) -> None:
-    rows = load_records()
-    updated = False
-    for idx, row in enumerate(rows):
-        if row["date"] == record["date"]:
-            rows[idx] = record
-            updated = True
-            break
-    if not updated:
-        rows.append(record)
-    rows.sort(key=lambda x: x["date"])
-
-    with DATA_FILE.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["date", "weekday", "start", "pause_minutes", "agile", "theoretical_exit", "final_exit"],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-
-def parse_hhmm(value: str) -> datetime:
-    return datetime.strptime(value, "%H:%M")
-
-
-
-def format_time(value: datetime) -> str:
-    return value.strftime("%H:%M")
-
-
-
-def compute_exit(start_value: time, pause_minutes: int) -> Dict[str, str]:
-    start_dt = datetime.combine(date.today(), start_value)
-    work_delta = timedelta(hours=ORE_LAVORO, minutes=MINUTI_LAVORO)
-    pause_delta = timedelta(minutes=pause_minutes)
-    total_delta = work_delta + pause_delta
-
-    theoretical_exit = start_dt + total_delta
-    minimum_exit = parse_hhmm(USCITA_MINIMA)
-    minimum_exit = minimum_exit.replace(year=theoretical_exit.year, month=theoretical_exit.month, day=theoretical_exit.day)
-    final_exit = max(theoretical_exit, minimum_exit)
-
-    return {
-        "theoretical_exit": format_time(theoretical_exit),
-        "final_exit": format_time(final_exit),
-        "total_duration": f"{int(total_delta.total_seconds() // 3600):02d}:{int((total_delta.total_seconds() // 60) % 60):02d}",
-        "extra_block": str(final_exit - theoretical_exit) if final_exit > theoretical_exit else "00:00:00",
-    }
-
-
-
-def week_bounds(ref_day: date) -> tuple[date, date]:
-    monday = ref_day - timedelta(days=ref_day.weekday())
-    sunday = monday + timedelta(days=6)
-    return monday, sunday
-
-
-
-def build_week_summary(records: List[Dict[str, str]], ref_day: date) -> List[Dict[str, str]]:
-    monday, _ = week_bounds(ref_day)
-    records_by_date = {row["date"]: row for row in records}
-    summary: List[Dict[str, str]] = []
-
-    for offset in range(7):
-        current_day = monday + timedelta(days=offset)
-        key = current_day.isoformat()
-        row = records_by_date.get(key)
-        summary.append(
-            {
-                "Giorno": f"{WEEKDAY_LABELS[current_day.weekday()]} {current_day.strftime('%d/%m')}",
-                "Ingresso": row["start"] if row else "—",
-                "Pausa": (f"{row['pause_minutes']} min" if row else "—"),
-                "Agile": ("Sì" if row and row["agile"] == "True" else ("No" if row else "—")),
-                "Uscita": row["final_exit"] if row else "—",
-            }
-        )
-    return summary
-
-
-
 def app_header() -> None:
-    st.markdown('<div class="main-title">🕒 Orario di uscita</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title">🕒 Orario di uscita</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="subtitle">Inserisci l’orario di inizio, scegli la pausa e salva la giornata. '
-        'Il riepilogo della settimana resta sempre sotto.</div>',
+        '<div class="subtitle">Inserisci l’inizio della giornata, scegli la pausa e pianifica il lavoro agile anche in anticipo.</div>',
         unsafe_allow_html=True,
     )
 
 
+def monday_reminder() -> None:
+    today = date.today()
+    if today.weekday() != 0:
+        return
 
-def render_reminder(selected_day: date) -> None:
-    if selected_day.weekday() == 0:
-        st.warning("Promemoria del lunedì: ricordati di inserire il lavoro agile della settimana.")
+    monday, sunday = current_week_bounds(today)
+    plans = read_csv(PLANS_CSV)
+    covered = 0
+    if not plans.empty and "date" in plans.columns:
+        week_dates = {(monday + timedelta(days=i)).isoformat() for i in range(5)}
+        covered = int(plans["date"].isin(week_dates).sum())
 
+    if covered < 5:
+        st.info("Promemoria del lunedì: imposta il lavoro agile della settimana qui sotto.")
+
+
+def planner_section() -> None:
+    st.subheader("Pianifica lavoro agile")
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        plan_date = st.date_input("Data da pianificare", value=date.today(), format="DD/MM/YYYY", key="plan_date")
+
+    existing_plan = get_plan_for_day(plan_date)
+
+    with col2:
+        plan_mode = st.selectbox(
+            "Modalità",
+            options=["Lavoro agile", "Presenza", "Non impostato"],
+            index=["Lavoro agile", "Presenza", "Non impostato"].index(existing_plan if existing_plan in ["Lavoro agile", "Presenza", "Non impostato"] else "Non impostato"),
+            key="plan_mode",
+        )
+
+    if st.button("Salva pianificazione", use_container_width=True):
+        save_plan(plan_date, plan_mode)
+        st.success(f"Pianificazione salvata per {plan_date.strftime('%d/%m/%Y')}.")
+
+
+def time_input_section(selected_date: date) -> time:
+    mode = st.radio(
+        "Come vuoi inserire l’orario?",
+        options=["Scrivo a mano", "Seleziono"],
+        horizontal=True,
+        key="input_mode",
+    )
+
+    saved_log = get_log_for_day(selected_date)
+    default_time = time(hour=9, minute=15)
+    if saved_log and saved_log.get("start_time"):
+        try:
+            default_time = parse_manual_time(str(saved_log["start_time"]))
+        except Exception:
+            default_time = time(hour=9, minute=15)
+
+    if mode == "Scrivo a mano":
+        manual_default = default_time.strftime("%H:%M")
+        start_text = st.text_input(
+            "Orario di inizio",
+            value=manual_default,
+            placeholder="09:15",
+            help="Formato HH:MM",
+            key="manual_time",
+        )
+        start_t = parse_manual_time(start_text)
+    else:
+        start_t = st.time_input(
+            "Orario di inizio",
+            value=default_time,
+            step=300,
+            key="picker_time",
+        )
+
+    return start_t
+
+
+def calculator_section() -> None:
+    st.subheader("Calcola uscita")
+    selected_date = st.date_input("Data del calcolo", value=date.today(), format="DD/MM/YYYY", key="calc_date")
+
+    plan_for_day = get_plan_for_day(selected_date)
+    if plan_for_day != "Non impostato":
+        st.caption(f"Per questa data hai impostato: **{plan_for_day}**")
+
+    try:
+        start_t = time_input_section(selected_date)
+    except ValueError:
+        st.error("Formato orario non valido. Usa HH:MM, per esempio 09:15.")
+        return
+
+    saved_log = get_log_for_day(selected_date)
+    pause_default = 30
+    if saved_log and str(saved_log.get("pause_minutes", "")) in {"30", "60"}:
+        pause_default = int(saved_log["pause_minutes"])
+
+    pause_label = st.radio(
+        "Pausa pranzo",
+        options=["30 minuti", "1 ora"],
+        index=0 if pause_default == 30 else 1,
+        horizontal=True,
+        key="pause_choice",
+    )
+    pause_minutes = 30 if pause_label == "30 minuti" else 60
+
+    work_mode_for_log = st.selectbox(
+        "Modalità per questo giorno",
+        options=["Lavoro agile", "Presenza", "Non impostato"],
+        index=["Lavoro agile", "Presenza", "Non impostato"].index(plan_for_day if plan_for_day in ["Lavoro agile", "Presenza", "Non impostato"] else "Non impostato"),
+        key="calc_work_mode",
+        help="Puoi modificarla qui anche se l’avevi già pianificata prima.",
+    )
+
+    if st.button("Calcola e salva", type="primary", use_container_width=True):
+        pause_td = timedelta(minutes=pause_minutes)
+        start_dt = combine_day_and_time(selected_date, start_t)
+        min_exit_dt = combine_day_and_time(selected_date, MIN_EXIT_TIME)
+
+        theoretical_exit_dt = start_dt + WORK_DURATION + pause_td
+        final_exit_dt = max(theoretical_exit_dt, min_exit_dt)
+
+        save_plan(selected_date, work_mode_for_log)
+        save_log(
+            selected_date,
+            start_t,
+            pause_minutes,
+            work_mode_for_log,
+            theoretical_exit_dt.time(),
+            final_exit_dt.time(),
+        )
+
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="soft">Puoi staccare alle</div>
+                <div class="result-time">{final_exit_dt.strftime("%H:%M")}</div>
+                <div class="soft">Calcolo: ingresso + 7:38 + pausa</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Uscita teorica", theoretical_exit_dt.strftime("%H:%M"))
+        c2.metric("Uscita minima", MIN_EXIT_TIME.strftime("%H:%M"))
+        c3.metric("Modalità", work_mode_for_log)
+
+        if final_exit_dt > theoretical_exit_dt:
+            st.info(
+                f"L’orario teorico sarebbe {theoretical_exit_dt.strftime('%H:%M')}, "
+                f"ma non puoi uscire prima delle {MIN_EXIT_TIME.strftime('%H:%M')}."
+            )
+        else:
+            st.success("Orario calcolato e salvato nel riepilogo settimanale.")
+
+
+def summary_section() -> None:
+    st.subheader("Riepilogo della settimana")
+    week_df = build_week_summary(date.today())
+    st.dataframe(week_df, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
-    inject_style()
-    ensure_storage()
+    style_page()
     app_header()
-
-    today = date.today()
-    default_start = time(hour=9, minute=15)
-
-    with st.container(border=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            selected_day = st.date_input("Giorno", value=today, format="DD/MM/YYYY")
-        with col2:
-            start_value = st.time_input("Orario di inizio", value=default_start, step=300)
-
-        render_reminder(selected_day)
-
-        col3, col4 = st.columns([1.2, 1])
-        with col3:
-            pause_label = st.radio("Pausa pranzo", ["30 minuti", "1 ora"], horizontal=True)
-        with col4:
-            agile = st.toggle("Lavoro agile", value=False)
-
-        pause_minutes = 30 if pause_label == "30 minuti" else 60
-        result = compute_exit(start_value, pause_minutes)
-
-        st.caption(
-            f"Lavoro fisso: {ORE_LAVORO}:{MINUTI_LAVORO:02d} · Pausa: {pause_minutes} min · Totale: {result['total_duration']}"
-        )
-
-    st.markdown(
-        f"""
-        <div class="result-card">
-            <div class="result-kicker">Puoi staccare alle</div>
-            <div class="result-time">{result['final_exit']}</div>
-            <div class="muted-note">Calcolo automatico: ingresso + 7:38 + pausa</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Uscita teorica", result["theoretical_exit"])
-    m2.metric("Uscita minima", USCITA_MINIMA)
-    m3.metric("Agile", "Sì" if agile else "No")
-
-    if result["final_exit"] != result["theoretical_exit"]:
-        st.info(
-            f"L’orario teorico sarebbe {result['theoretical_exit']}, ma non puoi uscire prima delle {USCITA_MINIMA}."
-        )
-
-    if st.button("Salva giornata", use_container_width=True):
-        record = {
-            "date": selected_day.isoformat(),
-            "weekday": WEEKDAY_LABELS[selected_day.weekday()],
-            "start": start_value.strftime("%H:%M"),
-            "pause_minutes": str(pause_minutes),
-            "agile": str(agile),
-            "theoretical_exit": result["theoretical_exit"],
-            "final_exit": result["final_exit"],
-        }
-        upsert_record(record)
-        st.success(f"Giornata del {selected_day.strftime('%d/%m/%Y')} salvata.")
-
-    st.markdown('<div class="week-card">', unsafe_allow_html=True)
-    monday, sunday = week_bounds(selected_day)
-    st.subheader("Riepilogo settimana")
-    st.caption(f"Da {monday.strftime('%d/%m')} a {sunday.strftime('%d/%m')}")
-
-    records = load_records()
-    weekly_data = build_week_summary(records, selected_day)
-    st.dataframe(weekly_data, use_container_width=True, hide_index=True)
-
-    saved_days = sum(1 for row in weekly_data if row["Ingresso"] != "—")
-    agile_days = sum(1 for row in weekly_data if row["Agile"] == "Sì")
-    c1, c2 = st.columns(2)
-    c1.metric("Giorni salvati", str(saved_days))
-    c2.metric("Giorni in agile", str(agile_days))
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    with st.expander("Come funziona"):
-        st.write(
-            """
-            - Inserisci **giorno** e **orario di inizio**.
-            - Scegli **30 minuti** oppure **1 ora** di pausa.
-            - Attiva **Lavoro agile** quando serve.
-            - Il lunedì compare un promemoria per ricordartelo.
-            - Premi **Salva giornata** per aggiornare il riepilogo della settimana.
-            """
-        )
-        st.caption(
-            "Nota: i dati vengono salvati in un file CSV locale dell’app. Se in futuro vuoi un salvataggio più stabile su più dispositivi, possiamo collegarla a Google Sheets."
-        )
+    monday_reminder()
+    planner_section()
+    st.divider()
+    calculator_section()
+    st.divider()
+    summary_section()
 
 
 if __name__ == "__main__":
